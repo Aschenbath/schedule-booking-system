@@ -158,6 +158,8 @@ export class Agent {
 
     // 4) 简单字段合并（改口只覆盖提到的字段，其它保留）
     let locationChanged = false;
+    const hadLocation = !!draft.location;
+    const hadTime = !!draft.start && !draft.timeNeedsClock;
     if (ex.subject) draft.subject = ex.subject;
     if (ex.location && ex.location !== draft.location) {
       draft.location = ex.location;
@@ -170,6 +172,7 @@ export class Agent {
 
     // 5) 时间：代码解析相对时间（NOW 可覆盖），改口只换说到的部分
     let timeChanged = false;
+    let timeEdited = false; // 用户这句话里真的改/给了时间（区别于程序补默认时长）
     if (ex.time_text) {
       const parsed = parseChineseTime(ex.time_text, nowT) ?? (ex.time_text !== text ? parseChineseTime(text, nowT) : null);
       if (parsed) {
@@ -183,6 +186,7 @@ export class Agent {
         draft.timeText = ex.time_text;
         if (parsed.end || parsed.durationMin) draft.durationDefaulted = false;
         timeChanged = true;
+        timeEdited = true;
       } else if (ex.start) {
         const s = fromIso(ex.start);
         if (s.isValid()) {
@@ -192,6 +196,7 @@ export class Agent {
           draft.timeNeedsClock = false;
           draft.timeText = ex.time_text;
           timeChanged = true;
+          timeEdited = true;
         }
       }
     } else if (ex.start && !draft.start) {
@@ -200,6 +205,7 @@ export class Agent {
         draft.start = toIso(s);
         draft.timeNeedsClock = false;
         timeChanged = true;
+        timeEdited = true;
       }
     }
     if (draft.start && !draft.end && draft.category && !draft.timeNeedsClock) {
@@ -209,6 +215,9 @@ export class Agent {
       draft.durationDefaulted = true;
       timeChanged = true;
     }
+    // 改口时明确复述改成了什么，其它信息不动
+    if (timeEdited && hadTime && draft.start && draft.end && !draft.timeNeedsClock) (facts.changed ??= []).push(`好，时间改为 ${fmtRange(draft.start, draft.end)}，其它信息不变。`);
+    if (locationChanged && hadLocation) (facts.changed ??= []).push(`地点改为${draft.location}。`);
 
     // 6) 人：部门/岗位/姓名展开成具体的人（代码做，0 人如实说）
     if (ex.remove_people?.length) {
@@ -257,6 +266,7 @@ export class Agent {
     facts.category = draft.category;
     facts.categoryLabel = draft.category ? CATEGORY_LABEL[draft.category] : null;
     facts.collected = summarize(draft);
+    if (!facts.askCategory && !facts.questions.length && needsConfirm && !facts.people.expansions.length && ex.intent !== 'submit') notes.push('参会名单还没确认，请在名单卡里核对后点“确认名单”，或回复“名单没问题”。');
 
     // 9) 提交意图
     if (ex.intent === 'submit') {

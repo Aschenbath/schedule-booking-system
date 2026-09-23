@@ -13,7 +13,8 @@
     "start": "npm run build -w web && npm run start -w server",
     "test": "npm test -w server",
     "reset": "node scripts/reset-db.mjs",
-    "probe": "node scripts/probe-llm.mjs"
+    "probe": "node scripts/probe-llm.mjs",
+    "smoke": "node scripts/smoke.mjs"
   },
   "devDependencies": {
     "concurrently": "^9.1.2"

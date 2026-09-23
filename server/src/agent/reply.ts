@@ -17,6 +17,8 @@ export function renderReply(f: ReplyFacts): string {
     lines.push('收到。先确认一下：这次是会议、接待、饭局，还是其他事项？');
   }
 
+  for (const c of f.changed ?? []) lines.push(c);
+
   const peopleLines: string[] = [];
   for (const e of f.people.expansions) {
     if (e.names.length === 0) peopleLines.push(`「${e.query}」没有找到任何成员，没法通知到任何人，请换个说法或指定具体的人。`);

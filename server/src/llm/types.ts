@@ -54,6 +54,7 @@ export interface ReplyFacts {
   };
   analysis?: Analysis | null;
   notes: string[];
+  changed?: string[]; // 本轮改口后被替换的信息（时间/地点），回复要先复述
   ready: boolean;
   submitted?: { requestId: string; duplicate?: boolean } | null;
   cancelled?: boolean;
