@@ -1,0 +1,26 @@
+# secrets
+.env
+.env.*
+!.env.example
+
+# deps / build
+node_modules/
+web/dist/
+*.tsbuildinfo
+
+# runtime data
+server/data/*.db
+server/data/*.db-*
+*.log
+
+# os / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# 个人工作备注，不上传
+*.local.md
+
+# 面试需求文档，不上传
+/老板日程预约系统-开发需求.md

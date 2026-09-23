@@ -1,0 +1,24 @@
+{
+  "name": "schedule-booking-system",
+  "private": true,
+  "version": "0.1.0",
+  "description": "日程预约系统：AI 预约小助手 + 老板审批 + 日程/车程 + 提醒中心",
+  "workspaces": [
+    "server",
+    "web"
+  ],
+  "scripts": {
+    "dev": "concurrently -k -n server,web -c blue,green \"npm:dev -w server\" \"npm:dev -w web\"",
+    "build": "npm run build -w web",
+    "start": "npm run build -w web && npm run start -w server",
+    "test": "npm test -w server",
+    "reset": "node scripts/reset-db.mjs",
+    "probe": "node scripts/probe-llm.mjs"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  },
+  "engines": {
+    "node": ">=22.13"
+  }
+}
