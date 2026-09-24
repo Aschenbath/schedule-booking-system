@@ -85,6 +85,7 @@ NOW=2026-09-23T09:44:00 npm start
 | 时间冲突 + 车程核实（“时间上不冲突，但车程赶不上”+ 建议） | `agent/schedule.ts` |
 | 地图失败 → 对话与审批卡片都标“车程未核实”，不假装算过 | `map/index.ts` 的 `FailingMapService`，后台可开关模拟故障 |
 | 老板审批 → 写日程、通知参会人（发起人不必确认参会），可改时间/拒绝 | `services/requests.ts` |
+| 提交后改口 / 取消：改了内容先说明“还没发给老板”，重交时撤回原请求再新建；“不约了”撤回请求；老板已同意则锁定并如实说明；卡片跟随请求实时状态（待批准/已同意/已拒绝/已撤回） | `agent/agent.ts`，`services/requests.ts` 的 `withdrawRequest` |
 | 提交 / 审批幂等 | 幂等键唯一索引 + `events.request_id UNIQUE` + 事务内条件更新 |
 | 开始前 N 分钟提醒：类别/主题/起止/地点/参与人/备注 + 地图导航链接 | `services/reminders.ts`，通知里的 `navUrl` |
 | 实时弹窗、错过的提醒只弹一次、多标签页不重复 | `services/notifications.ts` 的 Hub：每条通知只投递到同一用户的一个连接 |
@@ -101,6 +102,8 @@ npm test
 - `time.test.ts`：相对时间解析与改口合并。
 - `people.test.ts`：部门 / 岗位标签 / 姓名展开。
 - `approval.test.ts`：审批、改时间、拒绝、RSVP、提醒只建一次、错过的提醒只投递一次。
+- `audit.test.ts`：需求逐条核对后补的回归（A1–A9），如建议时间方向、跨会话重复提交、类别歧义追问、“现在怎么样了”不误判为地点。
+- `postsubmit.test.ts`：提交之后的一致性（P1–P8）：改内容重交先撤回、取消即撤回、老板已同意后锁定、被拒后如实说明、编辑期间老板先批了、改回原样不算修改、撤回权限与竞态。
 
 ## 目录
 
