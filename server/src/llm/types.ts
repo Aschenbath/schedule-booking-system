@@ -6,6 +6,8 @@ export interface Directory {
   departments: string[];
   tags: string[];
   names: string[];
+  /** 老板姓名：被预约的对象，不算“要通知的人” */
+  boss?: string;
 }
 export interface ChatTurn {
   role: 'user' | 'assistant';
@@ -33,6 +35,10 @@ export interface Extraction {
   counterpart?: string | null;
   headcount?: number | null;
   note?: string | null;
+  /** 只改时长时：总时长（分钟） */
+  duration_min?: number | null;
+  /** 只改时长时：在原来基础上延长多少分钟 */
+  extend_min?: number | null;
   people_queries?: string[] | null;
   remove_people?: string[] | null;
   intent?: 'submit' | 'cancel' | 'restart' | 'confirm_people' | null;
@@ -56,7 +62,13 @@ export interface ReplyFacts {
   notes: string[];
   changed?: string[]; // 本轮改口后被替换的信息（时间/地点），回复要先复述
   ready: boolean;
-  submitted?: { requestId: string; duplicate?: boolean } | null;
+  submitted?: { requestId: string; duplicate?: boolean; /** 撤回了哪条原请求后重新提交 */ replaced?: string } | null;
+  /** 这条对话之前提交过的请求，这句话没改内容时如实说明它的状态；approved 表示已写进日程、对话里不能再改 */
+  existing?: { requestId: string; status: 'pending' | 'approved' | 'rejected'; time: string; reason?: string } | null;
+  /** 这一轮撤回了哪条待批准的请求（取消 / 重来） */
+  withdrawn?: { requestId: string } | null;
+  /** 当前说话人就是老板本人：提交即直接写入日程，不走审批 */
+  self?: boolean;
   cancelled?: boolean;
   restarted?: boolean;
 }

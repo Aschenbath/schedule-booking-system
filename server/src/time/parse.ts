@@ -38,11 +38,12 @@ export function normalizeTimeText(text: string): string {
     .replace(/[：]/g, ':')
     .replace(/[～〜]/g, '~');
   // 中文数字 -> 阿拉伯数字（仅在时间/数量语境：点/时/号/日/月/小时/分钟/人 前）
-  t = t.replace(/([零一二两三四五六七八九十]+)(?=(点|时|号|日|月|个半?小时|小时|个钟头|分钟|分|人|位|刻))/g, (m) => {
+  t = t.replace(/([零一二两三四五六七八九十]+)(?=(点|时|号|日|月|个半?小时|小时|个半?钟头|分钟|分|人|位|刻))/g, (m) => {
     const n = cnToInt(m);
     return Number.isNaN(n) ? m : String(n);
   });
-  t = t.replace(/半个?小时/g, '30分钟').replace(/(\d+)个半小时/g, (_, n) => `${Number(n) * 60 + 30}分钟`);
+  // 先换“N个半小时”，否则“半小时”先被换掉，“两个半小时”会变成 30 分钟
+  t = t.replace(/(\d+)个半(?:小时|钟头)/g, (_, n) => `${Number(n) * 60 + 30}分钟`).replace(/半个?(?:小时|钟头)/g, '30分钟');
   return t;
 }
 
@@ -138,9 +139,49 @@ function parseClocks(t: string): ClockPart[] {
 
 function parseDuration(t: string): number | undefined {
   let m: RegExpMatchArray | null;
+  // “2小时30分钟”“1.5小时”“3小时半”
+  if ((m = t.match(/(\d+(?:\.\d+)?)\s*个?(?:小时|钟头)\s*(半|(\d+)\s*分钟?)?/))) return Math.round(Number(m[1]) * 60 + (m[2] === '半' ? 30 : m[3] ? Number(m[3]) : 0));
   if ((m = t.match(/(\d+)\s*分钟/))) return Number(m[1]);
-  if ((m = t.match(/(\d+)\s*个?(小时|钟头)/))) return Number(m[1]) * 60;
   return undefined;
+}
+
+export interface DurationChange {
+  /** 总时长（“要两个半小时”） */
+  totalMin?: number;
+  /** 在原来基础上加（“再加半小时”“延长一个小时”） */
+  extendMin?: number;
+  /** 只说了要更久，没说多久（“需要更长时间”） */
+  vague?: boolean;
+}
+
+/** 只改时长的说法：没有日期、没有钟点，parseChineseTime 会返回 null，这里单独识别 */
+export function parseDurationChange(text: string): DurationChange | null {
+  const t = normalizeTimeText(text);
+  if (/提前|提醒/.test(t)) return null; // “提前30分钟提醒”不是会议时长
+  const extend = t.match(/(?:再|多)(?:加|延长|留|给|开|安排)?\s*(?=\d)|延长\s*(?=\d)|加\s*(?=\d+(?:\.\d+)?\s*个?(?:小时|钟头|分钟))/);
+  const mins = parseDuration(t);
+  if (mins && extend) return { extendMin: mins };
+  if (mins && /(小时|钟头|分钟)/.test(t)) return { totalMin: mins };
+  if (/更长|长一点|长点|久一点|久点|多一点时间|多点时间|多留点|延长|不够|拉长/.test(t)) return { vague: true };
+  return null;
+}
+
+/** 只给了结束时刻（“得留到傍晚五点半”“开到6点”“5点半结束”）：开始已定时只改结束。“3点到5点”这种区间不算 */
+const UNTIL_CLOCK = String.raw`(凌晨|早上|上午|中午|下午|傍晚|晚上)?\s*(\d{1,2})\s*(?:[点时]\s*(半|\d{1,2})?\s*分?|:(\d{2}))`;
+const UNTIL_RE = [
+  new RegExp(String.raw`(?:^|[^\d点时:改挪换推提调移])(?:留|开|讲|聊|持续|延长|拖|弄|搞|一直)?到\s*` + UNTIL_CLOCK), // “改到5点”是挪开始时间，不算
+  new RegExp(String.raw`(?:^|[^\d到至~\-])` + UNTIL_CLOCK + String.raw`\s*(?:结束|散会|收尾)`),
+];
+export function parseUntil(text: string, start: Dayjs): Dayjs | null {
+  const t = normalizeTimeText(text);
+  const m = UNTIL_RE.map((re) => t.match(re)).find(Boolean);
+  if (!m) return null;
+  const [, periodWord, h, frac, mm] = m;
+  let hour = applyPeriod(Number(h), periodOf(periodWord));
+  const minute = frac === '半' ? 30 : frac ? Number(frac) : mm ? Number(mm) : 0;
+  if (!periodWord && hour < 12 && hour <= start.hour()) hour += 12; // 下午3点开始，“到5点”指17点
+  const end = start.hour(hour).minute(minute).second(0);
+  return end.isAfter(start) ? end : null;
 }
 
 export function parseChineseTime(text: string, now: Dayjs): ParsedTime | null {

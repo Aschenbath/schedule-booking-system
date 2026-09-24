@@ -24,8 +24,21 @@ const sending = ref(false);
 const error = ref('');
 const requests = ref<any[]>([]);
 const listEl = ref<HTMLElement | null>(null);
+const inputEl = ref<HTMLTextAreaElement | null>(null);
+const lastSent = ref('');
+const busy = ref(false);
 const selected = ref<Record<string, boolean>>({});
-
+// 预约对话只给员工用：员工向老板申请时间，语气是“想约/想请”，不是给别人下指令
+const bossTitle = computed(() => {
+  const b = store.users.find((u) => u.role === 'boss');
+  return b ? `${b.name.slice(0, 1)}总` : '老板';
+});
+const examples = computed(() => [
+  `想约${bossTitle.value}明天下午3点在公司开个会，汇报海珠别墅的设计方案，设计部同事一起参加`,
+  `周五上午10点碧桂园的王总来公司拜访谈合作，想请${bossTitle.value}一起接待，对方大概4个人`,
+  `想请${bossTitle.value}下周一晚上7点和万科李总吃饭，地点天河正佳`,
+]);
+const placeholder = computed(() => `说说想约${bossTitle.value}做什么，例如：想约${bossTitle.value}明天下午3点在公司开会，汇报海珠别墅方案`);
 const activeConv = computed(() => conversations.value.find((c) => c.id === activeId.value));
 
 async function loadConversations(selectFirst = true) {
@@ -36,21 +49,38 @@ async function loadRequests() {
   requests.value = await api('/requests?scope=mine');
 }
 async function openConversation(id: string) {
+  if (sending.value) return;
   activeId.value = id;
+  error.value = '';
   const conv = await api(`/conversations/${id}`);
   messages.value = conv.messages;
   draft.value = conv.draft;
   syncSelected();
   scrollDown();
+  focusInput();
 }
 async function newConversation() {
+  if (sending.value) return;
   const conv = await api('/conversations', { body: {} });
   await loadConversations(false);
   await openConversation(conv.id);
   messages.value = [
-    { id: 'hello', role: 'assistant', content: `你好${store.user?.name ? '，' + store.user.name : ''}！我是预约小助手。想约老板做什么？直接说，比如“明天下午3点在公司开会，讨论海珠别墅方案，叫上设计部”。`, cards: [] },
+    { id: 'hello', role: 'assistant', content: `你好${store.user?.name ? '，' + store.user.name : ''}！我是预约小助手，帮你约${bossTitle.value}的时间。想找${bossTitle.value}做什么、什么时候、在哪、有谁参加，直接说就行；我会帮你查${bossTitle.value}的日程冲突和路上车程，整理好后提交给${bossTitle.value}批准。`, cards: [] },
   ];
 }
+function autoGrow() {
+  const el = inputEl.value;
+  if (!el) return;
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 160) + 'px';
+}
+function focusInput() {
+  nextTick(() => {
+    inputEl.value?.focus();
+    autoGrow();
+  });
+}
+watch(input, () => nextTick(autoGrow));
 function scrollDown() {
   nextTick(() => {
     if (listEl.value) listEl.value.scrollTop = listEl.value.scrollHeight;
@@ -68,6 +98,7 @@ async function send(textOverride?: string) {
   if (!text || sending.value) return;
   if (!activeId.value) await newConversation();
   input.value = '';
+  lastSent.value = text;
   error.value = '';
   sending.value = true;
   messages.value = messages.value.filter((m) => m.id !== 'hello');
@@ -81,6 +112,7 @@ async function send(textOverride?: string) {
         reply.content += data.text;
         scrollDown();
       } else if (event === 'state') {
+        if (typeof data.content === 'string' && data.content) reply.content = data.content; // 以服务端落库的为准（流中断时会整条替换）
         reply.cards = data.cards;
         reply.id = data.messageId;
         draft.value = data.draft;
@@ -94,23 +126,43 @@ async function send(textOverride?: string) {
   } finally {
     reply.streaming = false;
     sending.value = false;
+    if (!reply.content && !reply.cards.length) messages.value = messages.value.filter((m) => m !== reply);
     scrollDown();
+    focusInput();
     loadConversations(false);
     loadRequests();
   }
 }
 
+function retry() {
+  const last = [...messages.value].reverse().find((m) => m.role === 'user');
+  if (last) messages.value = messages.value.filter((m) => m !== last);
+  send(lastSent.value);
+}
 async function confirmPeople(card: Card) {
+  if (busy.value) return;
   const ids = Object.entries(selected.value)
     .filter(([, v]) => v)
     .map(([k]) => k);
-  const r = await api(`/conversations/${activeId.value}/people/confirm`, { body: { ids } });
-  card.confirmed = true;
-  messages.value.push({ id: r.messageId, role: 'assistant', content: r.content, cards: r.cards });
-  draft.value = r.draft;
-  scrollDown();
+  busy.value = true;
+  error.value = '';
+  try {
+    const r = await api(`/conversations/${activeId.value}/people/confirm`, { body: { ids } });
+    card.confirmed = true;
+    messages.value.push({ id: r.messageId, role: 'assistant', content: r.content, cards: r.cards });
+    draft.value = r.draft;
+    scrollDown();
+  } catch (e: any) {
+    error.value = e.message;
+  } finally {
+    busy.value = false;
+    focusInput();
+  }
 }
 async function submit() {
+  if (busy.value) return;
+  busy.value = true;
+  error.value = '';
   try {
     const r = await api(`/conversations/${activeId.value}/submit`, { body: {} });
     messages.value.push({ id: r.messageId, role: 'assistant', content: r.content, cards: r.cards });
@@ -120,6 +172,8 @@ async function submit() {
     loadConversations(false);
   } catch (e: any) {
     error.value = e.message;
+  } finally {
+    busy.value = false;
   }
 }
 function pickSuggestion(label: string) {
@@ -132,14 +186,25 @@ function peopleOf(card: Card) {
   return out;
 }
 const isLast = (m: Msg) => messages.value[messages.value.length - 1] === m;
-const statusLabel: Record<string, string> = { pending: '待批准', approved: '已同意', rejected: '已拒绝' };
-const statusClass: Record<string, string> = { pending: 'warn', approved: 'ok', rejected: 'danger' };
+const statusLabel: Record<string, string> = { pending: '待批准', approved: '已同意', rejected: '已拒绝', withdrawn: '已撤回' };
+const statusClass: Record<string, string> = { pending: 'warn', approved: 'ok', rejected: 'danger', withdrawn: '' };
+// 对话里的“已提交”卡片跟着请求的最新状态走：老板批了、拒了，或者员工撤回了，旧卡片也不会一直显示“等待批准”
+const requestById = computed(() => new Map(requests.value.map((r) => [r.id, r])));
+const reqStatus = (id: string): string => requestById.value.get(id)?.status ?? 'pending';
 const travelLabel: Record<string, string> = { ok: '车程已核实', tight: '车程赶不上', unverified: '车程未核实', none: '' };
 
 function onKey(e: KeyboardEvent) {
-  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+  // 中文输入法选词时的回车不发送（keyCode 229 兼容旧版 Safari）
+  if (e.isComposing || e.keyCode === 229) return;
+  if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
     send();
+  } else if (e.key === 'ArrowUp' && !input.value && lastSent.value) {
+    e.preventDefault();
+    input.value = lastSent.value;
+    nextTick(() => inputEl.value?.setSelectionRange(input.value.length, input.value.length));
+  } else if (e.key === 'Escape' && input.value) {
+    input.value = '';
   }
 }
 
@@ -150,6 +215,7 @@ watch(
 onMounted(async () => {
   await Promise.all([loadConversations(), loadRequests()]);
   if (!conversations.value.length) await newConversation();
+  focusInput();
 });
 </script>
 
@@ -170,7 +236,8 @@ onMounted(async () => {
       <div ref="listEl" class="messages">
         <div v-for="m in messages" :key="m.id" class="msg" :class="m.role">
           <div class="who">{{ m.role === 'user' ? store.user?.name ?? '我' : '预约小助手' }}</div>
-          <div class="bubble" :class="{ cursor: m.streaming }">{{ m.content }}</div>
+          <div v-if="m.streaming && !m.content" class="bubble typing"><i /><i /><i /></div>
+          <div v-else class="bubble" :class="{ cursor: m.streaming }">{{ m.content }}</div>
           <div v-if="m.cards?.length" class="cards">
             <template v-for="(card, ci) in m.cards" :key="ci">
               <div v-if="card.type === 'people_confirm'" class="subcard">
@@ -182,7 +249,7 @@ onMounted(async () => {
                   </label>
                 </div>
                 <div v-if="!card.confirmed && isLast(m) && peopleOf(card).length" style="margin-top: 8px">
-                  <button class="btn sm primary" @click="confirmPeople(card)">确认名单</button>
+                  <button class="btn sm primary" :disabled="busy" @click="confirmPeople(card)">{{ busy ? '确认中…' : `确认名单（${Object.values(selected).filter(Boolean).length} 人）` }}</button>
                 </div>
               </div>
 
@@ -212,22 +279,31 @@ onMounted(async () => {
                   </template>
                 </div>
                 <div v-if="card.canSubmit && isLast(m) && !draft?.submittedRequestId" style="margin-top: 8px">
-                  <button class="btn sm primary" :disabled="sending" @click="submit">提交给老板批准</button>
+                  <button class="btn sm primary" :disabled="sending || busy" @click="submit">{{ busy ? '提交中…' : draft?.replacesRequestId ? '撤回原请求并重新提交' : `提交给${bossTitle}批准` }}</button>
                 </div>
               </div>
 
               <div v-else-if="card.type === 'submitted'" class="subcard">
-                <span class="badge warn">已提交，等待老板批准</span> <span class="small muted">请求号 {{ card.requestId.slice(0, 8) }}</span>
+                <span class="badge" :class="statusClass[reqStatus(card.requestId)]">{{ reqStatus(card.requestId) === 'pending' ? `已提交，等待${bossTitle}批准` : statusLabel[reqStatus(card.requestId)] }}</span> <span class="small muted">请求号 {{ card.requestId.slice(0, 8) }}</span>
               </div>
             </template>
           </div>
         </div>
+        <div v-if="!sending && messages.length <= 1" class="examples">
+          <div class="small muted">试试这样说：</div>
+          <button v-for="ex in examples" :key="ex" class="chip" @click="send(ex)">{{ ex }}</button>
+        </div>
       </div>
-      <div v-if="error" class="alert danger small">{{ error }}</div>
+      <div v-if="error" class="alert danger small row">
+        <span class="grow">{{ error }}</span>
+        <button v-if="lastSent" class="btn sm" :disabled="sending" @click="retry">重试</button>
+        <button class="btn sm" @click="error = ''">关闭</button>
+      </div>
       <div class="composer">
-        <textarea v-model="input" class="input" rows="1" placeholder="例如：明天下午3点在公司开会，讨论海珠别墅方案，叫上设计部" :disabled="sending" @keydown="onKey" />
+        <textarea ref="inputEl" v-model="input" class="input" rows="1" :placeholder="placeholder" :readonly="sending" @keydown="onKey" />
         <button class="btn primary" :disabled="sending || !input.trim()" @click="send()">{{ sending ? '回复中…' : '发送' }}</button>
       </div>
+      <div class="composer-hint small muted">Enter 发送 · Shift+Enter 换行 · ↑ 调出上一句 · Esc 清空</div>
     </section>
 
     <aside class="card chat-side req-list">
@@ -240,7 +316,7 @@ onMounted(async () => {
         </div>
         <div class="small muted">{{ r.categoryLabel }} · {{ r.timeLabel }}</div>
         <div class="small muted">{{ r.location }}<span v-if="r.analysis?.travelStatus && travelLabel[r.analysis.travelStatus]"> · {{ travelLabel[r.analysis.travelStatus] }}</span></div>
-        <div v-if="r.status === 'approved' && r.final_start !== r.start" class="small" style="color: var(--warn)">老板改为 {{ fmtTime(r.final_start) }}</div>
+        <div v-if="r.status === 'approved' && r.final_start !== r.start" class="small" style="color: var(--warn)">{{ bossTitle }}改为 {{ fmtTime(r.final_start) }}</div>
         <div v-if="r.status === 'rejected' && r.decision_note" class="small muted">原因：{{ r.decision_note }}</div>
       </div>
     </aside>

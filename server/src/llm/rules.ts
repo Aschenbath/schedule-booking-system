@@ -41,7 +41,8 @@ export class RulesLlm implements LlmClient {
     const pending = input.pendingFields;
 
     // ---- 意图 ----
-    if (/^(算了|取消|不约了|不用了|先不约|取消预约)/.test(raw) && !/改成|改到|换成|挪到/.test(raw)) {
+    // “算了，后天吧”“算了换后天”带了新时间或改的意思，是改口不是取消
+    if (/^(算了|取消|不约了|不用了|先不约|取消预约)/.test(raw) && !/改|换|挪|推到|提前/.test(raw) && !parseChineseTime(raw, input.now)) {
       out.intent = 'cancel';
       return out;
     }
@@ -64,7 +65,7 @@ export class RulesLlm implements LlmClient {
     else {
       const hits = CATEGORY_KEYWORDS.filter(([, re]) => re.test(raw)).map(([c]) => c);
       if (hits.length === 1) out.category = hits[0];
-      else if (hits.length > 1) out.category = hits.includes('dinner') && hits.includes('meeting') ? 'unsure' : hits[0];
+      else if (hits.length > 1) out.category = 'unsure'; // 同时像两类（“客户来公司开会”）就问，不猜
     }
 
     // ---- 时间 ----
@@ -81,14 +82,16 @@ export class RulesLlm implements LlmClient {
 
     // ---- 地点 ----
     let loc: string | undefined;
-    let m = raw.match(/(?:地点(?:在|是|：|:)|地址(?:在|是|：|:))([^，,。；;！!？?\s]{2,30})/);
+    // “地点天河正佳”“地点改到X”“地址：X”都算
+    let m = raw.match(/(?:地点|地址)(?:改为|改成|改到|换到|定在|在|是|：|:)?\s*([^，,。；;！!？?\s]{2,30})/);
     if (m) loc = m[1];
     if (!loc) {
-      m = raw.match(/(?:^|[，,。；;\s]|就|约|定|安排)?(?:在|去|到(?!\d))([^，,。；;！!？?\s\d]{1}[^，,。；;！!？?\s]{1,25}?)(?=开会|开个会|开|吃饭|吃个饭|吃|见面|碰头|接待|会面|进行|举行|聊|谈|讨论|评审|汇报|参观|考察|集合|等|一起|，|,|。|；|;|！|!|？|\?|$)/);
-      if (m && !/^(公司|家)(的)?(人|同事)/.test(m[1]) && !/^(明|后|今|下|这|本|周|星期|礼拜|上午|下午|晚上|中午)/.test(m[1])) loc = m[1];
+      // “现在/正在/还在…”里的“在”不是说地点；抽出来带疑问词的（“现在怎么样了”）也不是地点
+      m = raw.match(/(?:^|[，,。；;\s]|就|约|定|安排)?(?:(?<![现正还实存好所自])在|去|到(?!\d))([^，,。；;！!？?\s\d]{1}[^，,。；;！!？?\s]{1,25}?)(?=开会|开个会|开|吃饭|吃个饭|吃|见面|碰头|接待|会面|进行|举行|聊|谈|讨论|评审|汇报|参观|考察|集合|等|一起|，|,|。|；|;|！|!|？|\?|$)/);
+      if (m && !/^(公司|家)(的)?(人|同事)/.test(m[1]) && !/^(明|后|今|下|这|本|周|星期|礼拜|上午|下午|晚上|中午)/.test(m[1]) && !/怎么|什么|多少|哪|吗|呢/.test(m[1])) loc = m[1];
     }
-    if (!loc && pending.includes('location') && !parsed && raw.length <= 30 && !/通知|叫上|邀请/.test(raw)) loc = cut(raw);
-    if (loc) out.location = loc.replace(/^(在|去|到)/, '').replace(/(那里|那边|这边|这里)$/, '') || undefined;
+    if (!loc && pending.includes('location') && !parsed && raw.length <= 30 && !/通知|叫上|邀请|怎么|什么|多少|吗|呢|？|\?/.test(raw)) loc = cut(raw);
+    if (loc) out.location = loc.replace(/^(在|去|到)/, '').replace(/(那里|那边|这边|这里)$/, '').replace(/[吧呢啊呀哈了]+$/, '') || undefined;
 
     // ---- 主题 ----
     let subject: string | undefined;

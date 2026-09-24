@@ -8,7 +8,7 @@ import { getContact, allContacts, getSetting, setSetting, type EventRow, type Re
 import { now, toIso, fromIso, clock, TZ, fmtRange } from '../clock';
 import type { Agent } from '../agent/agent';
 import { expandPeople } from '../agent/people';
-import { travelBetweenEvents } from '../agent/schedule';
+import { travelBetweenEvents, geocodeCached, resolveAddress } from '../agent/schedule';
 import { CATEGORY_LABEL, type Category } from '../agent/schema';
 import { Hub, listNotifications } from '../services/notifications';
 import { approveRequest, rejectRequest, requestView, rsvp, RequestError, getRequest } from '../services/requests';
@@ -53,6 +53,7 @@ export function createApp(ctx: AppContext, hub: Hub, agent: Agent, opts: { stati
     c.json({
       now: toIso(now()),
       nowOverridden: clock.isOverridden(),
+      nowFrozen: clock.isOverridden() && config.nowMode === 'frozen',
       tz: TZ,
       llm: ctx.llm.mode,
       llmModel: ctx.llm.mode === 'openai' ? config.llm.model : null,
@@ -61,6 +62,18 @@ export function createApp(ctx: AppContext, hub: Hub, agent: Agent, opts: { stati
     }),
   );
   app.get('/api/users', (c) => c.json(allContacts(db)));
+  // 页面内小地图：地点 → 坐标（走缓存；地图失败时如实返回 ok:false，前端只显示地址和导航链接）
+  app.get('/api/geocode', async (c) => {
+    const loc = (c.req.query('q') ?? '').trim();
+    if (!loc) return c.json({ ok: false, reason: '地点为空' }, 400);
+    const address = resolveAddress(ctx, loc);
+    try {
+      const p = await geocodeCached(ctx, address);
+      return c.json({ ok: true, address, lng: p.lng, lat: p.lat, approximate: ctx.map.name !== 'amap' });
+    } catch (e: any) {
+      return c.json({ ok: false, address, reason: e?.message ?? '地图服务不可用' });
+    }
+  });
   app.get('/api/people/expand', (c) => c.json(expandPeople(db, c.req.query('q') ?? '')));
 
   // ---- 会话 ----
@@ -206,7 +219,13 @@ export function createApp(ctx: AppContext, hub: Hub, agent: Agent, opts: { stati
       if (k === 'map_simulate_failure') v = v === '1' || v === 'true' ? '1' : '0';
       setSetting(db, k, v);
       if (k === 'company_address' || k === 'home_address') {
-        db.prepare("UPDATE places SET address = ? WHERE name = ?").run(v, k === 'company_address' ? '公司' : '家');
+        const place = k === 'company_address' ? '公司' : '家';
+        const old = (db.prepare('SELECT address FROM places WHERE name = ?').get(place) as { address: string } | undefined)?.address;
+        if (old !== v) {
+          // 地址换了：旧坐标作废，下次按新地址重新解析；新旧地址的坐标缓存都清掉
+          db.prepare('UPDATE places SET address = ?, lng = NULL, lat = NULL WHERE name = ?').run(v, place);
+          db.prepare('DELETE FROM geocache WHERE address IN (?, ?, ?)').run(v, old ?? '', place);
+        }
       }
     }
     return c.json(Object.fromEntries(SETTING_KEYS.map((k) => [k, getSetting(db, k)])));

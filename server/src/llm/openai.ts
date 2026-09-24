@@ -23,10 +23,16 @@ export class OpenAiLlm implements LlmClient {
 
   async extract(input: ExtractInput): Promise<Extraction> {
     const directoryNames = input.directory.names.length > 60 ? input.directory.names.slice(0, 60) : input.directory.names;
+    // 历史对话放进系统提示当“参考记录”，而不是一问一答的消息：
+    // 否则有的模型会顺着对话接着“回复”，吐出一句话而不是 JSON
+    const transcript = input.history
+      .slice(-6)
+      .map((h) => `${h.role === 'user' ? '员工' : '小助手'}：${h.content.replace(/\s+/g, ' ').slice(0, 300)}`)
+      .join('\n');
+    const system = extractSystemPrompt(input.now, { ...input.directory, names: directoryNames }, input.draft, input.pendingFields);
     const messages: Msg[] = [
-      { role: 'system', content: extractSystemPrompt(input.now, { ...input.directory, names: directoryNames }, input.draft, input.pendingFields) },
-      ...input.history.slice(-6).map((h) => ({ role: h.role, content: h.content }) as Msg),
-      { role: 'user', content: input.text },
+      { role: 'system', content: transcript ? `${system}\n\n最近几轮对话（只用来理解指代和上下文，不要回复它）：\n${transcript}` : system },
+      { role: 'user', content: `员工这句话：${input.text}\n\n只输出 JSON。` },
     ];
     const raw = await this.complete(messages, { temperature: 0, json: true });
     return sanitize(parseJson(raw));
@@ -128,6 +134,10 @@ export function sanitize(o: any): Extraction {
   const hc = Number(o.headcount);
   out.headcount = Number.isFinite(hc) && hc > 0 ? Math.round(hc) : null;
   out.note = str(o.note);
+  const dm = Number(o.duration_min);
+  out.duration_min = Number.isFinite(dm) && dm > 0 ? Math.round(dm) : null;
+  const em = Number(o.extend_min);
+  out.extend_min = Number.isFinite(em) && em > 0 ? Math.round(em) : null;
   out.people_queries = strList(o.people_queries);
   out.remove_people = strList(o.remove_people);
   out.intent = typeof o.intent === 'string' && INTENTS.has(o.intent) ? (o.intent as Extraction['intent']) : null;

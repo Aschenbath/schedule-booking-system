@@ -73,7 +73,19 @@ export async function apiStream(path: string, body: unknown, onEvent: (event: st
   if (buf.trim()) flushBlock(buf);
 }
 
+const pad2 = (n: number) => String(n).padStart(2, '0');
+/**
+ * 时区一律按 Asia/Shanghai，不跟浏览器走：把任意时刻换成“北京时间墙上时钟”的 Date，
+ * 之后用 getHours()/getDate() 等本地取值拿到的就是北京时间（上海没有夏令时，固定 +08:00）。
+ */
+export const sh = (t: string | number | Date) => {
+  const ms = new Date(t).getTime();
+  return new Date(ms + (480 + new Date(ms).getTimezoneOffset()) * 60_000);
+};
+/** sh() 得到的墙上时钟 Date → 带 +08:00 的 ISO，发给后端 */
+export const shIso = (d: Date) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}T${pad2(d.getHours())}:${pad2(d.getMinutes())}:00+08:00`;
+
 export const fmtTime = (iso: string) => {
-  const d = new Date(iso);
+  const d = sh(iso);
   return `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
 };

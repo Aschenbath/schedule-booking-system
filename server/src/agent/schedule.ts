@@ -19,8 +19,9 @@ export interface NeighborCheck {
   travel: TravelInfo;
   /** true 够 / false 赶不上 / null 未核实 */
   enough: boolean | null;
-  /** 赶不上时建议的新开始时间（ISO） */
+  /** 赶不上时建议的新开始时间（ISO）：side=before 表示“这个时间或之后”，side=after 表示“这个时间或更早” */
   suggestStart?: string;
+  side?: 'before' | 'after';
 }
 export interface Suggestion {
   start: string;
@@ -85,6 +86,7 @@ const ceilTo = (d: Dayjs, step: number) => {
   const r = m % step === 0 ? 0 : step - (m % step);
   return d.add(r, 'minute').second(0).millisecond(0);
 };
+const floorTo = (d: Dayjs, step: number) => d.subtract(d.minute() % step, 'minute').second(0).millisecond(0);
 
 function eventsBetween(ctx: AppContext, from: Dayjs, to: Dayjs, excludeId?: string): EventRow[] {
   return (ctx.db.prepare('SELECT * FROM events WHERE start < ? AND end > ? AND (? IS NULL OR id != ?) ORDER BY start').all(toIso(to), toIso(from), excludeId ?? null, excludeId ?? null) as unknown) as EventRow[];
@@ -118,11 +120,12 @@ export async function analyzeSlot(ctx: AppContext, startIso: string, endIso: str
       enough = gapMin >= (travel.minutes ?? 0);
       if (!enough) {
         const dur = end.diff(start, 'minute');
-        const s = side === 'before' ? ceilTo(fromIso(nb.end).add(travel.minutes ?? 0, 'minute'), 5) : ceilTo(fromIso(nb.start).subtract((travel.minutes ?? 0) + dur, 'minute'), 5);
+        // 前一场卡住：最早能开始的时刻往后取整；后一场卡住：最晚能开始的时刻往前取整（往后取整反而赶不上）
+        const s = side === 'before' ? ceilTo(fromIso(nb.end).add(travel.minutes ?? 0, 'minute'), 5) : floorTo(fromIso(nb.start).subtract((travel.minutes ?? 0) + dur, 'minute'), 5);
         suggestStart = toIso(s);
       }
     }
-    return { eventId: nb.id, subject: nb.subject, start: nb.start, end: nb.end, location: nb.location, gapMin, travel, enough, suggestStart };
+    return { eventId: nb.id, subject: nb.subject, start: nb.start, end: nb.end, location: nb.location, gapMin, travel, enough, suggestStart, side };
   };
 
   if (location && before && conflicts.length === 0) analysis.before = await check(before, 'before');
@@ -200,7 +203,7 @@ export async function travelBetweenEvents(ctx: AppContext, events: EventRow[]): 
   for (let i = 0; i + 1 < sorted.length; i++) {
     const a = sorted[i];
     const b = sorted[i + 1];
-    if (!dayjs(a.start).isSame(dayjs(b.start), 'day')) continue;
+    if (!fromIso(a.start).isSame(fromIso(b.start), 'day')) continue; // 按北京时间判断是不是同一天
     const travel = await estimateTravel(ctx, a.location, b.location);
     const gapMin = fromIso(b.start).diff(fromIso(a.end), 'minute');
     const enough = travel.status === 'ok' ? gapMin >= (travel.minutes ?? 0) : travel.status === 'same_place' ? true : null;

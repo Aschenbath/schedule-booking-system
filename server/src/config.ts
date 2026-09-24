@@ -35,6 +35,15 @@ export const config = {
     apiKey: env('LLM_API_KEY'),
     model: env('LLM_MODEL', 'gpt-4o-mini'),
     timeoutMs: Number(env('LLM_TIMEOUT_MS', '30000')),
+    /** 备用渠道（OpenAI 兼容）：LLM_FALLBACK_BASE_URL / _API_KEY / _MODEL，多个用逗号分隔、按位置对应 */
+    fallbacks: env('LLM_FALLBACK_BASE_URL')
+      .split(',')
+      .map((u, i) => ({
+        baseUrl: u.trim().replace(/\/+$/, ''),
+        apiKey: (env('LLM_FALLBACK_API_KEY').split(',')[i] ?? '').trim(),
+        model: (env('LLM_FALLBACK_MODEL').split(',')[i] ?? '').trim() || env('LLM_MODEL', 'gpt-4o-mini'),
+      }))
+      .filter((c) => c.baseUrl),
   },
   map: {
     provider: env('MAP_PROVIDER', 'mock') as 'mock' | 'amap',

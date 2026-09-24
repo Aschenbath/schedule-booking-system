@@ -36,7 +36,9 @@ export function idempotencyKey(conversationId: string, d: Draft): string {
   return createHash('sha1').update(conversationId + '|' + JSON.stringify(core)).digest('hex');
 }
 
-/** 员工提交：重复提交返回同一条请求 */
+const DONE_TEXT: Record<string, string> = { approved: '被老板同意', rejected: '被老板拒绝', withdrawn: '被发起人撤回' };
+
+/** 员工提交：重复提交返回同一条请求（被拒、已撤回的请求在处理时已让出幂等键，同样内容再交是新请求） */
 export function submitRequest(ctx: AppContext, hub: Hub | null, conversationId: string, requesterId: string, d: Draft): { request: RequestRow; created: boolean } {
   if (!d.category || !d.start || !d.end) throw new RequestError('信息不完整，无法提交');
   const key = idempotencyKey(conversationId, d);
@@ -45,6 +47,11 @@ export function submitRequest(ctx: AppContext, hub: Hub | null, conversationId: 
   // 同一会话已有待批准请求也视为重复（防止改一个字重复刷请求）
   const pendingInConv = ctx.db.prepare("SELECT * FROM requests WHERE conversation_id = ? AND status = 'pending'").get(conversationId) as unknown as RequestRow | undefined;
   if (pendingInConv) return { request: pendingInConv, created: false };
+  // 换了个会话把同样的事再提一遍（同一发起人、同样的类别/主题/起止/地点，且还在待批准或已同意）也算重复
+  const sameElsewhere = ctx.db
+    .prepare("SELECT * FROM requests WHERE requester_id = ? AND category = ? AND subject = ? AND start = ? AND end = ? AND location = ? AND status IN ('pending', 'approved')")
+    .get(requesterId, d.category, draftTitle(d), d.start, d.end, d.location ?? '') as unknown as RequestRow | undefined;
+  if (sameElsewhere) return { request: sameElsewhere, created: false };
 
   const id = randomUUID();
   const created = transaction(ctx.db, () => {
@@ -73,6 +80,7 @@ export function submitRequest(ctx: AppContext, hub: Hub | null, conversationId: 
       );
     const boss = getBoss(ctx.db);
     const requester = getContact(ctx.db, requesterId);
+    if (requesterId === boss.id) return ctx.db.prepare('SELECT * FROM requests WHERE id = ?').get(id) as unknown as RequestRow;
     createNotification(ctx.db, {
       user_id: boss.id,
       type: 'request_new',
@@ -82,8 +90,18 @@ export function submitRequest(ctx: AppContext, hub: Hub | null, conversationId: 
     });
     return ctx.db.prepare('SELECT * FROM requests WHERE id = ?').get(id) as unknown as RequestRow;
   });
+  // 老板给自己加日程：不用自己审批自己，直接同意并写入日程、通知参与人
+  if (requesterId === getBoss(ctx.db).id) return { request: approveRequest(ctx, hub, id, { note: '老板本人添加' }).request, created: true };
   hub?.flush(ctx.db, getBoss(ctx.db).id);
   return { request: created, created: true };
+}
+
+/** 能拿来导航的坐标：接了真实高德，或者是通讯录/常用地点里登记过的地点；模拟地图估出来的坐标不可信，改用关键字搜索 */
+function trustedCoord(ctx: AppContext, address: string, coord: { lng: number; lat: number } | undefined) {
+  if (!coord) return null;
+  if (ctx.map.name === 'amap') return coord;
+  const known = ctx.db.prepare('SELECT 1 FROM places WHERE address = ? AND lng IS NOT NULL').get(address);
+  return known ? coord : null;
 }
 
 function eventBody(ctx: AppContext, e: EventRow) {
@@ -99,7 +117,7 @@ function eventBody(ctx: AppContext, e: EventRow) {
     time: fmtRange(e.start, e.end),
     location: e.location,
     address,
-    navUrl: navigationUrl(address || e.location, coord ?? null),
+    navUrl: navigationUrl(address || e.location, trustedCoord(ctx, address, coord)),
     attendees: names,
     note: e.note ?? '',
   };
@@ -113,7 +131,7 @@ export function approveRequest(ctx: AppContext, hub: Hub | null, id: string, opt
     if (req.status !== 'pending') {
       const ev = req.event_id ? (ctx.db.prepare('SELECT * FROM events WHERE id = ?').get(req.event_id) as unknown as EventRow) : undefined;
       if (req.status === 'approved' && ev) return { request: req, event: ev, created: false };
-      throw new RequestError(`该请求已${req.status === 'rejected' ? '被拒绝' : '处理'}，不能再批准`, 409);
+      throw new RequestError(`该请求已${DONE_TEXT[req.status] ?? '处理'}，不能再批准`, 409);
     }
     let finalStart = req.start;
     let finalEnd = req.end;
@@ -164,8 +182,9 @@ export function rejectRequest(ctx: AppContext, hub: Hub | null, id: string, reas
   const req = transaction(ctx.db, () => {
     const r = getRequest(ctx, id);
     if (!r) throw new RequestError('请求不存在', 404);
-    if (r.status !== 'pending') throw new RequestError('该请求已处理', 409);
-    ctx.db.prepare("UPDATE requests SET status = 'rejected', decision_note = ?, decided_at = ? WHERE id = ? AND status = 'pending'").run(reason ?? null, toIso(now()), id);
+    if (r.status !== 'pending') throw new RequestError(`该请求已${DONE_TEXT[r.status] ?? '处理'}`, 409);
+    // 幂等键让出来：员工改好后按同样内容再交，是一条新请求，而不是返回这条被拒的
+    ctx.db.prepare("UPDATE requests SET status = 'rejected', idempotency_key = idempotency_key || ':' || id, decision_note = ?, decided_at = ? WHERE id = ? AND status = 'pending'").run(reason ?? null, toIso(now()), id);
     createNotification(ctx.db, {
       user_id: r.requester_id,
       type: 'request_result',
@@ -176,6 +195,26 @@ export function rejectRequest(ctx: AppContext, hub: Hub | null, id: string, reas
     return getRequest(ctx, id)!;
   });
   hub?.flush(ctx.db, req.requester_id);
+  return req;
+}
+
+/** 发起人撤回还没批的请求：只有待批准的能撤，老板的待批准列表随即去掉它；老板已经处理过的不能撤 */
+export function withdrawRequest(ctx: AppContext, hub: Hub | null, id: string, requesterId: string): RequestRow {
+  const req = transaction(ctx.db, () => {
+    const r = getRequest(ctx, id);
+    if (!r || r.requester_id !== requesterId) throw new RequestError('请求不存在', 404);
+    const upd = ctx.db.prepare("UPDATE requests SET status = 'withdrawn', idempotency_key = idempotency_key || ':' || id, decided_at = ? WHERE id = ? AND status = 'pending'").run(toIso(now()), id);
+    if (Number(upd.changes) !== 1) throw new RequestError(`该请求已${DONE_TEXT[r.status] ?? '处理'}，不能撤回`, 409);
+    createNotification(ctx.db, {
+      user_id: getBoss(ctx.db).id,
+      type: 'request_withdrawn',
+      request_id: id,
+      title: `预约已撤回：${r.subject ?? '预约'}`,
+      body: { requestId: id, requester: getContact(ctx.db, requesterId)?.name ?? requesterId, category: CATEGORY_LABEL[r.category as Category] ?? r.category, time: fmtRange(r.start, r.end), location: r.location ?? '' },
+    });
+    return getRequest(ctx, id)!;
+  });
+  hub?.flush(ctx.db, getBoss(ctx.db).id);
   return req;
 }
 

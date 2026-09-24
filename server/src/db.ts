@@ -171,7 +171,8 @@ export interface RequestRow {
   counterpart: string | null;
   note: string | null;
   analysis: string | null;
-  status: 'pending' | 'approved' | 'rejected';
+  /** withdrawn：发起人在老板处理前撤回 */
+  status: 'pending' | 'approved' | 'rejected' | 'withdrawn';
   decision_note: string | null;
   final_start: string | null;
   final_end: string | null;

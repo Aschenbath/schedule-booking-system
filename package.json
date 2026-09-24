@@ -14,10 +14,12 @@
     "test": "npm test -w server",
     "reset": "node scripts/reset-db.mjs",
     "probe": "node scripts/probe-llm.mjs",
-    "smoke": "node scripts/smoke.mjs"
+    "smoke": "node scripts/smoke.mjs",
+    "record": "node scripts/record-demo.mjs"
   },
   "devDependencies": {
-    "concurrently": "^9.1.2"
+    "concurrently": "^9.1.2",
+    "playwright": "1.61.1"
   },
   "engines": {
     "node": ">=22.13"

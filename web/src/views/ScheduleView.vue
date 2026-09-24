@@ -1,19 +1,21 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted } from 'vue';
-import { api } from '../api';
+import { api, sh, shIso } from '../api';
 import { store } from '../store';
+import MiniMap from '../components/MiniMap.vue';
 
 const mode = ref<'day' | 'week'>('day');
-const anchor = ref(new Date(store.meta?.now ?? Date.now()));
+const anchor = ref(sh(store.meta?.now ?? Date.now())); // 以下日期运算都在北京时间墙上时钟上做
 const events = ref<any[]>([]);
 const travel = ref<any[]>([]);
 const loading = ref(false);
+const mapOpen = ref<Record<string, boolean>>({});
 
 const WD = ['日', '一', '二', '三', '四', '五', '六'];
 const p = (n: number) => String(n).padStart(2, '0');
 const dayKey = (d: Date) => `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 const hm = (iso: string) => {
-  const d = new Date(iso);
+  const d = sh(iso);
   return `${p(d.getHours())}:${p(d.getMinutes())}`;
 };
 const startOfDay = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate());
@@ -34,7 +36,7 @@ const days = computed(() => {
   for (let d = new Date(range.value.from); d < range.value.to; d.setDate(d.getDate() + 1)) out.push(new Date(d));
   return out;
 });
-const todayKey = computed(() => dayKey(new Date(store.meta?.now ?? Date.now())));
+const todayKey = computed(() => dayKey(sh(store.meta?.now ?? Date.now())));
 const title = computed(() => {
   const f = range.value.from;
   if (mode.value === 'day') return `${f.getMonth() + 1}月${f.getDate()}日 周${WD[f.getDay()]}`;
@@ -46,7 +48,7 @@ const title = computed(() => {
 async function load() {
   loading.value = true;
   try {
-    const q = `from=${encodeURIComponent(range.value.from.toISOString())}&to=${encodeURIComponent(range.value.to.toISOString())}`;
+    const q = `from=${encodeURIComponent(shIso(range.value.from))}&to=${encodeURIComponent(shIso(range.value.to))}`;
     const r = await api(`/events?${q}`);
     events.value = r.events;
     travel.value = r.travel;
@@ -60,9 +62,9 @@ function shift(n: number) {
   anchor.value = d;
 }
 function goToday() {
-  anchor.value = new Date(store.meta?.now ?? Date.now());
+  anchor.value = sh(store.meta?.now ?? Date.now());
 }
-const eventsOf = (d: Date) => events.value.filter((e) => dayKey(new Date(e.start)) === dayKey(d));
+const eventsOf = (d: Date) => events.value.filter((e) => dayKey(sh(e.start)) === dayKey(d));
 const travelAfter = (id: string) => travel.value.find((t) => t.fromId === id);
 const travelText = (t: any) => {
   if (!t) return '';
@@ -97,16 +99,19 @@ onMounted(load);
     <div v-if="mode === 'day'" class="card timeline">
       <div v-if="!eventsOf(days[0]).length" class="empty">这一天没有日程</div>
       <template v-for="e in eventsOf(days[0])" :key="e.id">
-        <div class="event" :class="e.category">
+        <div class="event with-map" :class="[e.category, { open: mapOpen[e.id] }]">
+          <div>
           <div class="row">
             <strong>{{ hm(e.start) }}–{{ hm(e.end) }}</strong>
             <span class="badge primary">{{ e.categoryLabel }}</span>
             <strong class="grow">{{ e.subject }}</strong>
             <span v-if="e.source === 'request'" class="badge ok">预约</span>
           </div>
-          <div class="small">📍 <a :href="navUrl(e.location)" target="_blank" rel="noopener">{{ e.location }}</a></div>
+          <div class="small">📍 {{ e.location }}<button type="button" class="map-toggle" :class="{ on: mapOpen[e.id] }" @click="mapOpen[e.id] = !mapOpen[e.id]">{{ mapOpen[e.id] ? '收起地图' : '🗺 看地图' }}</button></div>
           <div v-if="e.attendees.length" class="small muted">参与：{{ e.attendees.join('、') }}</div>
           <div v-if="e.note" class="small muted">备注：{{ e.note }}</div>
+          </div>
+          <MiniMap v-if="mapOpen[e.id]" :q="e.location" :nav-url="navUrl(e.location)" :height="180" />
         </div>
         <div v-if="travelAfter(e.id)" class="travel" :class="travelClass(travelAfter(e.id))">🚗 {{ travelText(travelAfter(e.id)) }}</div>
       </template>

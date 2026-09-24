@@ -1,27 +1,49 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue';
+import { ref, computed, onMounted, onBeforeUnmount } from 'vue';
+import { onBeforeRouteLeave } from 'vue-router';
 import { api } from '../api';
 import { store, loadBootstrap } from '../store';
 
 const form = ref<Record<string, string>>({});
 const msg = ref('');
 const err = ref('');
+const saved = ref('');
+const saving = ref(false);
+const dirty = computed(() => JSON.stringify(form.value) !== saved.value);
 
 async function load() {
   form.value = await api('/settings');
+  saved.value = JSON.stringify(form.value);
 }
 async function save() {
+  if (!store.isBoss || saving.value || !dirty.value) return;
+  saving.value = true;
   msg.value = '';
   err.value = '';
   try {
     form.value = await api('/settings', { method: 'PUT', body: form.value });
+    saved.value = JSON.stringify(form.value);
     msg.value = '已保存';
+    setTimeout(() => (msg.value = ''), 2000);
     await loadBootstrap();
   } catch (e: any) {
     err.value = e.message;
+  } finally {
+    saving.value = false;
   }
 }
-onMounted(load);
+function onKey(e: KeyboardEvent) {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+    e.preventDefault();
+    save();
+  }
+}
+onBeforeRouteLeave(() => !dirty.value || window.confirm('设置还没保存，确定离开吗？'));
+onMounted(() => {
+  load();
+  window.addEventListener('keydown', onKey);
+});
+onBeforeUnmount(() => window.removeEventListener('keydown', onKey));
 </script>
 
 <template>
@@ -56,7 +78,8 @@ onMounted(load);
         <label class="row" style="cursor: pointer"><input type="checkbox" :checked="form.map_simulate_failure === '1'" @change="form.map_simulate_failure = ($event.target as HTMLInputElement).checked ? '1' : '0'" /> 模拟地图接口故障（用于演示“车程未核实”）</label>
       </label>
       <div class="row">
-        <button class="btn primary" :disabled="!store.isBoss" @click="save">保存</button>
+        <button class="btn primary" :disabled="!store.isBoss || !dirty || saving" @click="save">{{ saving ? '保存中…' : '保存' }}</button>
+        <span v-if="dirty && store.isBoss" class="small muted row" style="gap: 6px"><i class="dirty-dot" />有未保存的修改（Ctrl+S 保存）</span>
         <span v-if="msg" class="badge ok">{{ msg }}</span>
         <span v-if="err" class="badge danger">{{ err }}</span>
       </div>

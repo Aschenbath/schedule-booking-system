@@ -2,9 +2,12 @@
 import { ref, watch, onMounted } from 'vue';
 import { api, fmtTime } from '../api';
 import { store } from '../store';
+import MiniMap from '../components/MiniMap.vue';
 
 const items = ref<any[]>([]);
 const busy = ref(false);
+// 展开了小地图的通知 id
+const mapOpen = ref<Record<string, boolean>>({});
 
 async function load() {
   items.value = await api('/notifications');
@@ -24,8 +27,8 @@ async function tick() {
   await api('/admin/tick-reminders', { body: {} });
   await load();
 }
-const typeLabel: Record<string, string> = { reminder: '日程提醒', invite: '会议通知', request_result: '审批结果', request_new: '新预约请求' };
-const typeClass: Record<string, string> = { reminder: 'warn', invite: 'ok', request_result: 'primary', request_new: 'primary' };
+const typeLabel: Record<string, string> = { reminder: '日程提醒', invite: '会议通知', request_result: '审批结果', request_new: '新预约请求', request_withdrawn: '预约撤回' };
+const typeClass: Record<string, string> = { reminder: 'warn', invite: 'ok', request_result: 'primary', request_new: 'primary', request_withdrawn: '' };
 
 watch(() => store.refreshTick, load);
 onMounted(load);
@@ -50,23 +53,29 @@ onMounted(load);
         <strong class="grow">{{ n.title }}</strong>
         <span class="small muted">{{ fmtTime(n.created_at) }}</span>
       </div>
-      <div v-if="n.type === 'reminder' || n.type === 'invite'" class="kv small" style="margin-top: 6px">
+      <div v-if="n.type === 'reminder' || n.type === 'invite'" class="with-map" :class="{ open: mapOpen[n.id] }" style="margin-top: 6px">
+      <div class="kv small">
         <span class="k">类别</span><span>{{ n.payload.category }}</span>
         <span class="k">主题</span><span>{{ n.payload.subject }}</span>
         <span class="k">时间</span><span>{{ n.payload.time }}</span>
-        <span class="k">地点</span><span><a :href="n.payload.navUrl" target="_blank" rel="noopener">{{ n.payload.location }} 📍导航</a></span>
+        <span class="k">地点</span><span><a v-if="n.payload.navUrl" class="nav-link" :href="n.payload.navUrl" target="_blank" rel="noopener" title="一点打开高德导航">📍 {{ n.payload.location }}</a><template v-else>{{ n.payload.location }}</template><button type="button" class="map-toggle" :class="{ on: mapOpen[n.id] }" @click="mapOpen[n.id] = !mapOpen[n.id]">{{ mapOpen[n.id] ? '收起地图' : '🗺 看地图' }}</button></span>
         <span class="k">参与人</span><span>{{ n.payload.attendees?.length ? n.payload.attendees.join('、') : '无' }}</span>
         <template v-if="n.payload.note"><span class="k">备注</span><span>{{ n.payload.note }}</span></template>
+      </div>
+      <MiniMap v-if="mapOpen[n.id]" :q="n.payload.address || n.payload.location" :nav-url="n.payload.navUrl" />
       </div>
       <div v-else-if="n.type === 'request_new'" class="small muted" style="margin-top: 4px">
         {{ n.payload.requester }} 发起 · {{ n.payload.category }} · {{ n.payload.time }} · {{ n.payload.location }}
         <span v-if="n.payload.travelStatus === 'unverified'" class="badge danger">车程未核实</span>
         <router-link to="/approvals" style="margin-left: 8px">去审批</router-link>
       </div>
+      <div v-else-if="n.type === 'request_withdrawn'" class="small muted" style="margin-top: 4px">
+        {{ n.payload.requester }} 撤回了这条预约 · {{ n.payload.category }} · {{ n.payload.time }}<span v-if="n.payload.location"> · {{ n.payload.location }}</span>
+      </div>
       <div v-else-if="n.type === 'request_result'" class="small muted" style="margin-top: 4px">
         {{ n.payload.time }}<span v-if="n.payload.location"> · {{ n.payload.location }}</span>
         <span v-if="n.payload.reason"> · 原因：{{ n.payload.reason }}</span>
-        <span v-if="n.payload.result === 'approved'"> · 已通知 {{ n.payload.notified }} 位参会人</span>
+        <span v-if="n.payload.result === 'approved'"> · {{ n.payload.notified ? `已通知 ${n.payload.notified} 位参会人` : '没有需要通知的参会人' }}</span>
       </div>
       <div v-if="n.type === 'invite'" class="row" style="margin-top: 8px">
         <template v-if="n.rsvp">

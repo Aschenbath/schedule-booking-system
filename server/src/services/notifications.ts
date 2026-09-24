@@ -63,7 +63,7 @@ export class Hub {
 
 export interface NewNotification {
   user_id: string;
-  type: NotificationRow['type'] | 'request_new';
+  type: NotificationRow['type'] | 'request_new' | 'request_withdrawn';
   event_id?: string | null;
   request_id?: string | null;
   title: string;

@@ -1,16 +1,16 @@
 import { randomUUID } from 'node:crypto';
 import type { AppContext } from '../context';
 import type { Hub } from '../services/notifications';
-import { allContacts, getContact } from '../db';
+import { allContacts, getContact, getBoss, type RequestRow } from '../db';
 import { now, toIso, fromIso, fmtRange } from '../clock';
-import { parseChineseTime, mergeTime } from '../time/parse';
+import { parseChineseTime, mergeTime, parseDurationChange, parseUntil } from '../time/parse';
 import { expandMany, uniqueContacts, type Expansion } from './people';
 import { analyzeSlot, type Analysis } from './schedule';
 import { CATEGORY_LABEL, DEFAULT_DURATION_MIN, FIELD_QUESTION, emptyDraft, missingFields, draftTitle, type Draft, type FieldKey, type ExpansionSummary } from './schema';
-import { renderReply } from './reply';
+import { renderReply, existingText } from './reply';
 import { RulesLlm } from '../llm/rules';
 import type { Extraction, ReplyFacts, ChatTurn, Directory } from '../llm/types';
-import { submitRequest, RequestError } from '../services/requests';
+import { submitRequest, withdrawRequest, getRequest, RequestError } from '../services/requests';
 
 export type Card =
   | { type: 'people_confirm'; expansions: ExpansionSummary[]; selectedIds: string[]; confirmed: boolean }
@@ -103,7 +103,7 @@ export class Agent {
     const contacts = allContacts(this.ctx.db);
     const departments = (this.ctx.db.prepare('SELECT name FROM departments').all() as { name: string }[]).map((r) => r.name);
     const tags = [...new Set(contacts.map((c) => c.title))];
-    return { departments, tags, names: contacts.map((c) => c.name) };
+    return { departments, tags, names: contacts.map((c) => c.name), boss: getBoss(this.ctx.db).name };
   }
 
   // ---------- 一轮对话 ----------
@@ -112,23 +112,14 @@ export class Agent {
     if (!conv) throw new RequestError('会话不存在', 404);
     const user = getContact(this.ctx.db, conv.user_id);
     let draft = this.loadDraft(conv);
+    // 这句话之前信息是否已经齐了（员工看过完整摘要）——提交必须建立在这之上
+    const readyBefore = !!draft.category && !!draft.start && !draft.timeNeedsClock && missingFields(draft).length === 0;
     const history = this.history(convId);
     this.addMessage(convId, 'user', text);
     const nowT = now();
     const notes: string[] = [];
-
-    // 1) 听懂：模型（或规则）抽取增量信息
-    const input = { now: nowT, draft, pendingFields: draft.pendingFields ?? [], history, text, directory: this.directory() };
-    let ex: Extraction;
-    try {
-      ex = await this.ctx.llm.extract(input);
-    } catch (e) {
-      console.warn('[agent] llm.extract failed, fallback to rules:', (e as Error).message);
-      ex = await this.rules.extract(input);
-      notes.push('（模型暂时不可用，这句话按离线规则理解，如有偏差请直接纠正我）');
-    }
-
     const facts: ReplyFacts = {
+      self: conv.user_id === getBoss(this.ctx.db).id,
       userName: user?.name ?? conv.user_id,
       category: null,
       categoryLabel: null,
@@ -141,8 +132,48 @@ export class Agent {
       ready: false,
     };
 
+    // 0) 这条对话提交过的请求老板已经同意、写进日程：对话里不能再改或取消，如实说明，草稿不动
+    const lockedReply = (r: RequestRow) => {
+      facts.existing = existingInfo(r);
+      return this.finish(convId, draft, facts, history, []);
+    };
+    const linkedId = draft.submittedRequestId ?? draft.replacesRequestId;
+    let sent = linkedId ? getRequest(this.ctx, linkedId) : undefined;
+    if (sent?.status === 'approved') {
+      yield* lockedReply(sent);
+      return;
+    }
+
+    // 1) 听懂：模型（或规则）抽取增量信息
+    const input = { now: nowT, draft, pendingFields: draft.pendingFields ?? [], history, text, directory: this.directory() };
+    let ex: Extraction;
+    try {
+      ex = await this.ctx.llm.extract(input);
+    } catch (e) {
+      console.warn('[agent] llm.extract failed, fallback to rules:', (e as Error).message);
+      ex = await this.rules.extract(input);
+      notes.push('（模型暂时不可用，这句话按离线规则理解，如有偏差请直接纠正我）');
+    }
+    // 抽取要几秒，老板可能正好在这期间批了：后面一律按请求的最新状态判断
+    if (sent) sent = getRequest(this.ctx, sent.id);
+    if (sent?.status === 'approved') {
+      yield* lockedReply(sent);
+      return;
+    }
+
     // 2) 意图：取消 / 重来
+    // 模型把“算了，后天吧”标成取消、却同时给了新时间/地点：按改口处理，不清空草稿
+    if (ex.intent === 'cancel' && (ex.time_text || ex.start || ex.location || ex.duration_min || ex.extend_min)) ex.intent = null;
     if (ex.intent === 'cancel' || ex.intent === 'restart') {
+      // 已经提交、老板还没处理：撤回，老板那边不会再看到；撤回的瞬间老板刚好批了，就如实说已写进日程
+      if (sent?.status === 'pending') {
+        const r = this.withdraw(sent.id, conv.user_id);
+        if (r.status === 'approved') {
+          yield* lockedReply(r);
+          return;
+        }
+        if (r.status === 'withdrawn') facts.withdrawn = { requestId: r.id };
+      }
       draft = emptyDraft();
       if (ex.intent === 'cancel') facts.cancelled = true;
       else facts.restarted = true;
@@ -151,7 +182,7 @@ export class Agent {
     }
 
     // 3) 类别（判不准就问，不猜）
-    if (ex.category === 'unsure') draft.category = null;
+    if (ex.category === 'unsure') draft.category ??= null; // 已经定了的类别不被后面一句含糊话清掉
     else if (ex.category) draft.category = ex.category;
     facts.askCategory = !draft.category;
     if (facts.askCategory) draft.categoryAsked = true;
@@ -173,7 +204,17 @@ export class Agent {
     // 5) 时间：代码解析相对时间（NOW 可覆盖），改口只换说到的部分
     let timeChanged = false;
     let timeEdited = false; // 用户这句话里真的改/给了时间（区别于程序补默认时长）
-    if (ex.time_text) {
+    let durationSet = false; // 这句话里的时间已经带了结束/时长
+    // 开始已定、这句只说“留到/开到X点”“X点结束”：只改结束时间，不当成新的开始时间
+    const untilSrc = ex.time_text ?? text;
+    const untilEnd = draft.start && !draft.timeNeedsClock && !/今天|明天|后天|周|星期|礼拜|月|号/.test(untilSrc) ? parseUntil(untilSrc, fromIso(draft.start)) : null;
+    if (untilEnd) {
+      draft.end = toIso(untilEnd);
+      draft.durationDefaulted = false;
+      durationSet = true;
+      timeChanged = true;
+      timeEdited = true;
+    } else if (ex.time_text) {
       const parsed = parseChineseTime(ex.time_text, nowT) ?? (ex.time_text !== text ? parseChineseTime(text, nowT) : null);
       if (parsed) {
         const prevStart = draft.start ? fromIso(draft.start) : undefined;
@@ -185,6 +226,7 @@ export class Agent {
         draft.timeNeedsClock = parsed.hasClock ? false : parsed.hasDate && !parsed.period && prevHadClock ? false : true;
         draft.timeText = ex.time_text;
         if (parsed.end || parsed.durationMin) draft.durationDefaulted = false;
+        durationSet = !!(parsed.end || parsed.durationMin);
         timeChanged = true;
         timeEdited = true;
       } else if (ex.start) {
@@ -193,6 +235,7 @@ export class Agent {
           draft.start = toIso(s);
           const e = ex.end ? fromIso(ex.end) : null;
           draft.end = e && e.isValid() && e.isAfter(s) ? toIso(e) : undefined;
+          durationSet = !!draft.end;
           draft.timeNeedsClock = false;
           draft.timeText = ex.time_text;
           timeChanged = true;
@@ -208,12 +251,42 @@ export class Agent {
         timeEdited = true;
       }
     }
+    if (draft.start && !draft.end && draft.pendingDurationMin && !draft.timeNeedsClock) {
+      draft.end = toIso(fromIso(draft.start).add(draft.pendingDurationMin, 'minute'));
+      draft.pendingDurationMin = undefined;
+      durationSet = true;
+      timeChanged = true;
+    }
+    let defaultNote = -1; // 本轮补了默认时长的提示在 notes 里的位置
+    let askedDuration = false; // 本轮已经问了“要多久”，算一个问题
     if (draft.start && !draft.end && draft.category && !draft.timeNeedsClock) {
       const mins = DEFAULT_DURATION_MIN[draft.category];
       draft.end = toIso(fromIso(draft.start).add(mins, 'minute'));
-      if (!draft.durationDefaulted) notes.push(`结束时间没说，先按${CATEGORY_LABEL[draft.category]}默认 ${mins} 分钟安排（${fmtRange(draft.start, draft.end)}），需要更长可以告诉我。`);
+      if (!draft.durationDefaulted) defaultNote = notes.push(`结束时间没说，先按${CATEGORY_LABEL[draft.category]}默认 ${mins} 分钟安排（${fmtRange(draft.start, draft.end)}），需要更长可以告诉我。`) - 1;
       draft.durationDefaulted = true;
       timeChanged = true;
+    }
+    // 只改时长（“要两个半小时”“再加半小时”）：开始不变，只挪结束时间；只说“要更久”就问多久
+    if (!durationSet) {
+      const dc = parseDurationChange(ex.time_text ?? text) ?? (ex.time_text ? parseDurationChange(text) : null);
+      const total = ex.duration_min ?? dc?.totalMin;
+      const extend = ex.extend_min ?? dc?.extendMin;
+      if (draft.start && !draft.timeNeedsClock && (total || extend)) {
+        const s = fromIso(draft.start);
+        const base = draft.end ? fromIso(draft.end) : s;
+        draft.end = toIso(total ? s.add(total, 'minute') : base.add(extend!, 'minute'));
+        draft.durationDefaulted = false;
+        timeChanged = true;
+        timeEdited = true;
+      } else if (total || extend) {
+        notes.push(`记下了，时长${total ? `约 ${total} 分钟` : `延长 ${extend} 分钟`}；等开始时间定了我按这个算结束时间。`);
+        if (total) draft.pendingDurationMin = total;
+      } else if (dc?.vague && draft.start && draft.end && !draft.timeNeedsClock) {
+        // 时刻还没定时不问时长（时间那个问题已经覆盖）；同一轮刚补的默认时长提示换成这句，避免自相矛盾
+        if (defaultNote >= 0) notes.splice(defaultNote, 1);
+        askedDuration = true;
+        notes.push(`现在按 ${fmtRange(draft.start, draft.end)} 安排。要留多长时间？告诉我时长（如“两个小时”）或结束时间（如“到5点半”），我来调整。`);
+      }
     }
     // 改口时明确复述改成了什么，其它信息不动
     if (timeEdited && hadTime && draft.start && draft.end && !draft.timeNeedsClock) (facts.changed ??= []).push(`好，时间改为 ${fmtRange(draft.start, draft.end)}，其它信息不变。`);
@@ -228,6 +301,10 @@ export class Agent {
       draft.attendees.ids = draft.attendees.ids.filter((id) => keep.has(id) && !rm.has(getContact(this.ctx.db, id)?.name ?? ''));
       draft.attendees.names = draft.attendees.ids.map((id) => getContact(this.ctx.db, id)?.name ?? id);
     }
+    // 老板本人是被预约的对象，不当作“要通知的人”去展开（否则会报“张总没有找到成员”）
+    const boss = getBoss(this.ctx.db);
+    const bossAlias = new Set([boss.name, `${boss.name.slice(0, 1)}总`, '老板', '老总', boss.title, `${boss.name.slice(0, 1)}${boss.title}`]);
+    if (ex.people_queries?.length) ex.people_queries = ex.people_queries.filter((q) => !bossAlias.has(q.replace(/^(和|跟|与|叫上|通知|请)/, '').trim()));
     if (ex.people_queries?.length) {
       const fresh = ex.people_queries.filter((q) => !draft.peopleQueries.includes(q));
       if (fresh.length) {
@@ -244,7 +321,26 @@ export class Agent {
         facts.people.emptyQueries = summaries.filter((s) => s.ids.length === 0).map((s) => s.query);
       }
     }
+    // 提交有副作用，不能只凭模型的一个标签：之前没看过完整摘要、或者这句话还在改内容/加人，就先不提交，给员工看摘要确认
+    if (ex.intent === 'submit' && (!readyBefore || timeChanged || locationChanged || !!ex.subject || !!ex.people_queries?.length || !!ex.remove_people?.length)) ex.intent = null;
     if ((ex.intent === 'confirm_people' || ex.intent === 'submit') && draft.attendees.ids.length) draft.attendees.confirmed = true; // “没问题，提交”= 名单也没问题
+
+    // 提交过之后的这句话：内容变了 → 原请求先留着，等员工确认后撤回重交；没变 → 后面如实说原请求的状态
+    let unchangedSince: RequestRow | undefined;
+    if (sent) {
+      const same = sameContent(draft, sent);
+      if (sent.status === 'pending') {
+        draft.submittedRequestId = same ? sent.id : undefined;
+        draft.replacesRequestId = same ? undefined : sent.id;
+        if (same) unchangedSince = sent;
+      } else if (sent.status === 'rejected' && same && draft.submittedRequestId) {
+        unchangedSince = sent;
+      } else {
+        // 被拒后改了内容 / 已撤回：这份草稿就是一份新的预约，可以重新提交
+        draft.submittedRequestId = undefined;
+        draft.replacesRequestId = undefined;
+      }
+    }
 
     // 7) 冲突 + 车程（代码做；地图失败标 unverified）
     const timeComplete = !!draft.start && !!draft.end && !draft.timeNeedsClock;
@@ -255,7 +351,7 @@ export class Agent {
 
     // 8) 缺什么问什么，一轮最多两项
     const missing = draft.category ? missingFields(draft) : [];
-    const ask = facts.askCategory ? [] : missing.slice(0, 2);
+    const ask = facts.askCategory ? [] : missing.slice(0, askedDuration ? 1 : 2); // 问了时长就只再问一项
     facts.questions = ask.map((f) => this.question(f, draft));
     draft.pendingFields = ask;
     const needsConfirm = draft.attendees.ids.length > 0 && !draft.attendees.confirmed;
@@ -271,12 +367,19 @@ export class Agent {
     // 9) 提交意图
     if (ex.intent === 'submit') {
       if (ready) {
-        const { request, created } = submitRequest(this.ctx, this.hub, convId, conv.user_id, draft);
-        draft.submittedRequestId = request.id;
-        facts.submitted = { requestId: request.id, duplicate: !created };
+        const r = this.submitDraft(convId, conv.user_id, draft);
+        if (r.locked) facts.existing = existingInfo(r.request);
+        else {
+          facts.submitted = { requestId: r.request.id, duplicate: !r.created, replaced: r.replaced };
+          facts.self = r.request.requester_id === getBoss(this.ctx.db).id;
+        }
       } else if (needsConfirm) notes.push('提交前请先确认参会名单。');
       else if (missing.length) notes.push('还差一些信息，补齐后就可以提交。');
     }
+    // 提交过的那条这句话没改：如实说它现在的状态，不再请员工确认提交
+    if (!facts.submitted && !facts.existing && unchangedSince) facts.existing = existingInfo(unchangedSince);
+    if (!facts.submitted && !facts.existing && draft.replacesRequestId)
+      notes.push(`这条预约之前已经提交（请求号 ${draft.replacesRequestId.slice(0, 8)}），刚才的修改还没发给老板；确认无误后点按钮或回复“提交”，我会撤回原请求、按新内容重新提交。`);
 
     yield* this.finish(convId, draft, facts, history, this.buildCards(draft, facts));
   }
@@ -291,6 +394,8 @@ export class Agent {
   }
 
   private buildCards(draft: Draft, facts: ReplyFacts): Card[] {
+    // 已提交的请求原样没动：只挂它的状态，不再出“提交”按钮
+    if (facts.existing) return facts.existing.status === 'pending' ? [{ type: 'submitted', requestId: facts.existing.requestId }] : [];
     const cards: Card[] = [];
     if (draft.attendees.expansions.length) cards.push({ type: 'people_confirm', expansions: draft.attendees.expansions, selectedIds: draft.attendees.ids, confirmed: draft.attendees.confirmed });
     const a = facts.analysis ?? (facts.ready ? draft.analysis : null);
@@ -311,10 +416,10 @@ export class Agent {
       if (!content.trim()) throw new Error('empty reply');
     } catch (e) {
       console.warn('[agent] llm.streamReply failed, fallback to template:', (e as Error).message);
+      // 流到一半断了：丢掉半句，整条换成模板回复（前端以 state.content 为准覆盖）
       const fallback = renderReply(facts);
-      const add = content.trim() ? `\n${fallback}` : fallback;
-      content += add;
-      yield { type: 'delta', text: add };
+      if (!content.trim()) yield { type: 'delta', text: fallback };
+      content = fallback;
     }
     const messageId = this.addMessage(convId, 'assistant', content, cards);
     this.saveDraft(convId, draft);
@@ -334,10 +439,11 @@ export class Agent {
     const missing = draft.category ? missingFields(draft) : [];
     const ready = !!draft.category && missing.length === 0;
     const items = summarize(draft);
+    const isBoss = conv.user_id === getBoss(this.ctx.db).id;
     const cards: Card[] = [{ type: 'people_confirm', expansions: draft.attendees.expansions, selectedIds: valid, confirmed: true }];
     let content = valid.length ? `名单已确认（${valid.length} 人）：${draft.attendees.names.join('、')}。` : '名单已清空，这次不通知其他人。';
     if (ready) {
-      content += `\n信息齐了，请确认：\n${items.map((i) => `${i.label}：${i.value}`).join('\n')}\n没问题的话点“提交给老板批准”，或回复“提交”。`;
+      content += `\n信息齐了，请确认：\n${items.map((i) => `${i.label}：${i.value}`).join('\n')}\n${isBoss ? '没问题的话点“加入日程”，或回复“提交”。' : '没问题的话点“提交给老板批准”，或回复“提交”。'}`;
       cards.push({ type: 'summary', items, canSubmit: true });
     } else if (missing.length) {
       const ask = missing.slice(0, 2);
@@ -356,14 +462,79 @@ export class Agent {
     const missing = draft.category ? missingFields(draft) : [];
     if (!draft.category || missing.length) throw new RequestError('信息还不完整，不能提交');
     if (draft.attendees.ids.length && !draft.attendees.confirmed) throw new RequestError('请先确认参会名单');
-    const { request, created } = submitRequest(this.ctx, this.hub, convId, conv.user_id, draft);
-    draft.submittedRequestId = request.id;
-    const cards: Card[] = [{ type: 'submitted', requestId: request.id }];
-    const content = created ? `已提交给老板批准（请求号 ${request.id.slice(0, 8)}）。老板同意后才会写入日程并通知相关的人。` : `这条请求之前已经提交过了（请求号 ${request.id.slice(0, 8)}），没有重复创建。`;
+    const { request, created, replaced, locked } = this.submitDraft(convId, conv.user_id, draft);
+    const self = request.requester_id === getBoss(this.ctx.db).id;
+    const no = (id: string) => id.slice(0, 8);
+    const cards: Card[] = locked ? [] : [{ type: 'submitted', requestId: request.id }];
+    const content = locked
+      ? existingText(existingInfo(request), self)
+      : !created
+        ? `这条请求之前已经提交过了（请求号 ${no(request.id)}），没有重复创建。`
+        : self
+          ? `已加入您的日程（${fmtRange(request.start, request.end)}），参与人已收到通知。`
+          : replaced
+            ? `已撤回原请求（请求号 ${no(replaced)}），并按新内容重新提交给老板批准（请求号 ${no(request.id)}）。老板同意后才会写入日程并通知相关的人。`
+            : `已提交给老板批准（请求号 ${no(request.id)}）。老板同意后才会写入日程并通知相关的人。`;
     const messageId = this.addMessage(convId, 'assistant', content, cards);
     this.saveDraft(convId, draft);
     return { request, created, messageId, content, cards, draft };
   }
+
+  /** 撤回这条对话里还在待批准的请求；老板恰好先处理了，就返回它的最新状态 */
+  private withdraw(id: string, userId: string): RequestRow {
+    try {
+      return withdrawRequest(this.ctx, this.hub, id, userId);
+    } catch (e) {
+      if (e instanceof RequestError && e.status === 409) return getRequest(this.ctx, id)!;
+      throw e;
+    }
+  }
+
+  /** 提交草稿：提交后改过内容的，先撤回原来那条待批准的再交新的；原来那条老板已经批了，就不交新的，如实返回它 */
+  private submitDraft(convId: string, userId: string, draft: Draft): { request: RequestRow; created: boolean; replaced?: string; locked?: boolean } {
+    let replaced: string | undefined;
+    if (draft.replacesRequestId) {
+      const old = getRequest(this.ctx, draft.replacesRequestId);
+      const r = old?.status === 'pending' ? this.withdraw(old.id, userId) : old;
+      if (r?.status === 'approved') {
+        draft.submittedRequestId = r.id;
+        draft.replacesRequestId = undefined;
+        return { request: r, created: false, locked: true };
+      }
+      if (old?.status === 'pending' && r?.status === 'withdrawn') replaced = r.id;
+      draft.replacesRequestId = undefined;
+    }
+    const { request, created } = submitRequest(this.ctx, this.hub, convId, userId, draft);
+    draft.submittedRequestId = request.id;
+    return { request, created, replaced };
+  }
+}
+
+/** 草稿和已提交的请求内容是否一致：决定这句话算不算“改了已提交的预约” */
+function sameContent(d: Draft, r: RequestRow): boolean {
+  const ids = (a: string[]) => JSON.stringify([...a].sort());
+  return (
+    d.category === r.category &&
+    draftTitle(d) === (r.subject ?? '') &&
+    d.start === r.start &&
+    d.end === r.end &&
+    (d.location ?? '') === (r.location ?? '') &&
+    ids(d.attendees.ids) === ids(JSON.parse(r.attendees) as string[]) &&
+    (d.headcount ?? null) === r.headcount &&
+    (d.visitor ?? null) === r.visitor &&
+    (d.counterpart ?? null) === r.counterpart &&
+    (d.note ?? null) === r.note
+  );
+}
+
+/** 已提交请求的现状（给回复用）；老板改过时间的按改后的时间说 */
+function existingInfo(r: RequestRow): NonNullable<ReplyFacts['existing']> {
+  return {
+    requestId: r.id,
+    status: r.status as 'pending' | 'approved' | 'rejected',
+    time: fmtRange(r.final_start ?? r.start, r.final_end ?? r.end),
+    reason: r.status === 'rejected' ? r.decision_note ?? undefined : undefined,
+  };
 }
 
 function toSummary(e: Expansion): ExpansionSummary {

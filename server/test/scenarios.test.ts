@@ -196,6 +196,71 @@ describe('对话场景（离线规则模型 + 模拟地图，不联网）', () =
     expect(fmt(event.start)).toBe('2026-09-25 19:00');
   });
 
+  it('S10b “地点天河正佳”这种没有“在/是”的说法也能识别地点，不再追问', async () => {
+    const conv = env.agent.createConversation('u019');
+    const t = await chat(env.agent, conv.id, '下周一晚上7点请万科李总吃饭，地点天河正佳，一共5个人');
+    expect(t.draft.location).toBe('天河正佳');
+    expect(t.draft.pendingFields ?? []).not.toContain('location');
+    expect(t.content).not.toContain('地点在哪里');
+  });
+
+  it('S10c 老板本人提交不会进待批准，直接写入日程', async () => {
+    const conv = env.agent.createConversation('u001');
+    await chat(env.agent, conv.id, '周五晚上7点跟建材供应商吃饭，在陶陶居北京路店，一共6个人');
+    const t2 = await chat(env.agent, conv.id, '提交');
+    const reqId = card(t2.cards, 'submitted')!.requestId;
+    const row = env.ctx.db.prepare('SELECT status, event_id FROM requests WHERE id = ?').get(reqId) as unknown as RequestRow;
+    expect(row.status).toBe('approved');
+    expect(row.event_id).toBeTruthy();
+    expect(t2.content).not.toContain('等老板批准');
+  });
+
+  it('S10d 只说时长：“需要两个半小时”改结束时间，开始不变，不塞进备注', async () => {
+    const conv = env.agent.createConversation(LIU_YANG);
+    const t1 = await chat(env.agent, conv.id, '后天下午3点在公司开会，主题海珠别墅设计方案汇报');
+    expect(fmt(t1.draft.start!)).toBe('2026-09-25 15:00');
+    const t2 = await chat(env.agent, conv.id, '需要两个半小时');
+    expect(fmt(t2.draft.start!)).toBe('2026-09-25 15:00');
+    expect(fmt(t2.draft.end!)).toBe('2026-09-25 17:30');
+    expect(t2.draft.note ?? '').not.toContain('小时');
+    const t3 = await chat(env.agent, conv.id, '再加半小时');
+    expect(fmt(t3.draft.end!)).toBe('2026-09-25 18:00');
+  });
+
+  it('S10e 只说“需要更长时间”会问要多久，不会装没听见', async () => {
+    const conv = env.agent.createConversation(LIU_YANG);
+    await chat(env.agent, conv.id, '后天下午3点在公司开会，主题海珠别墅设计方案汇报');
+    const t = await chat(env.agent, conv.id, '需要更长时间');
+    expect(t.content).toMatch(/多长时间|时长/);
+  });
+
+  it('S10f 先说时长、后给开始时间，结束时间按先说的时长算', async () => {
+    const conv = env.agent.createConversation(LIU_YANG);
+    await chat(env.agent, conv.id, '想约张总开会，主题样板间方案，在公司，大概要一个半小时');
+    const t = await chat(env.agent, conv.id, '后天上午10点');
+    expect(fmt(t.draft.start!)).toBe('2026-09-25 10:00');
+    expect(fmt(t.draft.end!)).toBe('2026-09-25 11:30');
+  });
+
+  it('S10h “得留到傍晚五点半”只改结束时间；“改到5点”才是挪开始', async () => {
+    const conv = env.agent.createConversation(LIU_YANG);
+    await chat(env.agent, conv.id, '后天下午3点在公司开会，主题海珠别墅设计方案汇报');
+    const t1 = await chat(env.agent, conv.id, '一个钟头讲不完，得留到傍晚五点半');
+    expect(fmt(t1.draft.start!)).toBe('2026-09-25 15:00');
+    expect(fmt(t1.draft.end!)).toBe('2026-09-25 17:30');
+    const t2 = await chat(env.agent, conv.id, '开到6点吧');
+    expect(fmt(t2.draft.end!)).toBe('2026-09-25 18:00');
+    const t3 = await chat(env.agent, conv.id, '算了改到明天下午4点');
+    expect(fmt(t3.draft.start!)).toBe('2026-09-24 16:00');
+  });
+
+  it('S10g “约张总”里的张总是被预约的老板，不当参与人去查', async () => {
+    const conv = env.agent.createConversation(LIU_YANG);
+    const t = await chat(env.agent, conv.id, '想约张总后天下午3点在公司开个会，汇报海珠别墅的设计方案');
+    expect(t.content).not.toContain('没有找到');
+    expect(t.draft.peopleQueries).not.toContain('张总');
+  });
+
   it('S11 同一请求重复提交、重复批准，都不会建出两条', async () => {
     const conv = env.agent.createConversation('u019');
     await chat(env.agent, conv.id, '周五晚上7点跟建材供应商吃饭，在陶陶居北京路店，一共6个人');

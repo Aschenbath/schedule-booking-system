@@ -10,6 +10,8 @@ export interface User {
 export interface Meta {
   now: string;
   nowOverridden: boolean;
+  /** NOW_MODE=frozen：时间停在 NOW 不走 */
+  nowFrozen?: boolean;
   tz: string;
   llm: string;
   llmModel: string | null;
@@ -57,6 +59,7 @@ watch(
     } catch {
       /* ignore */
     }
+    store.toasts = []; // 弹窗属于上一个用户，换人就清掉
     connectStream();
   },
 );

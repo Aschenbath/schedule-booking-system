@@ -24,3 +24,12 @@ Thumbs.db
 
 # 需求文档，不上传
 /老板日程预约系统-开发需求.md
+
+# 演示录屏只留本地，不上传
+recordings/
+
+# 临时诊断脚本
+server/_*.ts
+server/_*.txt
+server/_*.json
+scripts/_*.py

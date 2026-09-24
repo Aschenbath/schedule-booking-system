@@ -47,6 +47,8 @@ export interface Draft {
   timeText?: string;
   timeNeedsClock?: boolean; // 只有“上午/下午”没有具体时刻
   durationDefaulted?: boolean;
+  /** 先说了时长、还没定开始时间时暂存（分钟） */
+  pendingDurationMin?: number;
   location?: string;
   visitor?: string;
   counterpart?: string;
@@ -58,6 +60,8 @@ export interface Draft {
   pendingFields?: FieldKey[];
   analysis?: import('./schedule').Analysis;
   submittedRequestId?: string;
+  /** 提交后又改了内容：这条待批准的请求在员工确认重交时撤回 */
+  replacesRequestId?: string;
 }
 
 export const emptyDraft = (): Draft => ({ category: null, peopleQueries: [], attendees: { ids: [], names: [], confirmed: false, expansions: [] } });
